@@ -10,13 +10,13 @@ from torchvision.datasets import CocoDetection
 from torch.utils.data import DataLoader
 import torchvision.transforms as T
 import torch.optim as optim
-from transformers import DetrForObjectDetection, AdamW
+from torch.optim import AdamW
 from pycocotools.coco import COCO
 from pycocotools.cocoeval import COCOeval
 import tqdm
 
 # === AYARLAR ===
-DATASET_DIR = '/Users/bilge/Downloads/roboflow'
+DATASET_DIR = 'C:/Users/Bilge/Downloads/dataset'
 DATA_YAML = os.path.join(DATASET_DIR, 'data.yaml')
 DATA_COCO_TRAIN = os.path.join(DATASET_DIR, 'train', 'annotations.coco.json')
 DATA_COCO_VAL = os.path.join(DATASET_DIR, 'valid', 'annotations.coco.json')
@@ -47,7 +47,7 @@ def run_coco_eval(gt_json, pred_json, out_csv):
 def train_yolov8():
     print("Training YOLOv8...")
     model = YOLO('yolov8m.pt')
-    model.train(data=DATA_YAML, epochs=50, imgsz=640, project=RESULTS_DIR, name='YOLOv8_run', save=True)
+    model.train(data=DATA_YAML, epochs=25, imgsz=640, project=RESULTS_DIR, name='YOLOv8_run', save=True)
     print("Evaluating YOLOv8...")
     model = YOLO(os.path.join(RESULTS_DIR, "YOLOv8_run", "weights", "best.pt"))
     metrics = model.val()
@@ -75,10 +75,15 @@ def train_retinanet():
     val_loader = DataLoader(val_dataset, batch_size=4, shuffle=False, num_workers=2)
 
     optimizer = optim.AdamW(model.parameters(), lr=1e-4)
-    num_epochs = 50
+    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=15, gamma=0.1)
+    num_epochs = 25
+    best_map = 0
+    patience = 5
+    no_improve = 0
 
     for epoch in range(num_epochs):
         print(f"[RetinaNet] Epoch {epoch+1}/{num_epochs}")
+        model.train()
         for images, targets in tqdm.tqdm(train_loader):
             images = [img.to(device) for img in images]
             targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
@@ -89,32 +94,43 @@ def train_retinanet():
             loss.backward()
             optimizer.step()
 
-    print("Evaluating RetinaNet...")
-    model.eval()
-    results = []
-    with torch.no_grad():
-        for images, targets in tqdm.tqdm(val_loader):
-            images = [img.to(device) for img in images]
-            outputs = model(images)
-            for i, output in enumerate(outputs):
-                boxes = output['boxes'].cpu()
-                scores = output['scores'].cpu()
-                labels = output['labels'].cpu()
-                image_id = targets[i]['image_id'].item()
-                for box, score, label in zip(boxes, scores, labels):
-                    x1, y1, x2, y2 = box.tolist()
-                    results.append({
-                        'image_id': image_id,
-                        'category_id': label.item(),
-                        'bbox': [x1, y1, x2 - x1, y2 - y1],
-                        'score': score.item()
-                    })
+        scheduler.step()
 
-    pred_json = os.path.join(RESULTS_DIR, 'retinanet_predictions.json')
-    with open(pred_json, 'w') as f:
-        json.dump(results, f)
-
-    run_coco_eval(DATA_COCO_VAL, pred_json, os.path.join(RESULTS_DIR, 'retinanet_metrics.csv'))
+        # Değerlendirme
+        model.eval()
+        results = []
+        with torch.no_grad():
+            for images, targets in val_loader:
+                images = [img.to(device) for img in images]
+                outputs = model(images)
+                for i, output in enumerate(outputs):
+                    boxes = output['boxes'].cpu()
+                    scores = output['scores'].cpu()
+                    labels = output['labels'].cpu()
+                    image_id = targets[i]['image_id'].item()
+                    for box, score, label in zip(boxes, scores, labels):
+                        x1, y1, x2, y2 = box.tolist()
+                        results.append({
+                            'image_id': image_id,
+                            'category_id': label.item(),
+                            'bbox': [x1, y1, x2 - x1, y2 - y1],
+                            'score': score.item()
+                        })
+        pred_json = os.path.join(RESULTS_DIR, 'retinanet_predictions.json')
+        with open(pred_json, 'w') as f:
+            json.dump(results, f)
+        run_coco_eval(DATA_COCO_VAL, pred_json, os.path.join(RESULTS_DIR, 'retinanet_metrics.csv'))
+        current_map = pd.read_csv(os.path.join(RESULTS_DIR, 'retinanet_metrics.csv'))['mAP@[IoU=0.5:0.95]'][0]
+        if current_map > best_map:
+            best_map = current_map
+            no_improve = 0
+            torch.save(model.state_dict(), os.path.join(RESULTS_DIR, 'retinanet_best.pth'))
+            print(f"Yeni en iyi RetinaNet modeli kaydedildi (mAP={best_map:.4f})")
+        else:
+            no_improve += 1
+            if no_improve >= patience:
+                print("Erken durdurma tetiklendi.")
+                break
 
 # === DETR ===
 def train_detr():
@@ -128,10 +144,15 @@ def train_detr():
     val_loader = DataLoader(val_dataset, batch_size=4, shuffle=False, num_workers=2)
 
     optimizer = AdamW(model.parameters(), lr=1e-4)
-    num_epochs = 50
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=15, gamma=0.1)
+    num_epochs = 25
+    best_map = 0
+    patience = 5
+    no_improve = 0
 
     for epoch in range(num_epochs):
         print(f"[DETR] Epoch {epoch+1}/{num_epochs}")
+        model.train()
         for images, targets in tqdm.tqdm(train_loader):
             pixel_values = torch.stack([img for img in images]).to(device)
             outputs = model(pixel_values=pixel_values)
@@ -140,35 +161,45 @@ def train_detr():
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
+        scheduler.step()
 
-    print("Evaluating DETR...")
-    model.eval()
-    results = []
-    with torch.no_grad():
-        for images, targets in tqdm.tqdm(val_loader):
-            pixel_values = torch.stack([img for img in images]).to(device)
-            outputs = model(pixel_values=pixel_values)
-            for i, logits in enumerate(outputs.logits):
-                probas = logits.softmax(-1)[..., :-1]
-                scores, labels = probas.max(-1)
-                boxes = outputs.pred_boxes[i].cpu()
-                image_id = targets[i]['image_id'].item()
-                for box, score, label in zip(boxes, scores.cpu(), labels.cpu()):
-                    cx, cy, w, h = box.tolist()
-                    x = cx - w / 2
-                    y = cy - h / 2
-                    results.append({
-                        'image_id': image_id,
-                        'category_id': label.item(),
-                        'bbox': [x, y, w, h],
-                        'score': score.item()
-                    })
-
-    pred_json = os.path.join(RESULTS_DIR, 'detr_predictions.json')
-    with open(pred_json, 'w') as f:
-        json.dump(results, f)
-
-    run_coco_eval(DATA_COCO_VAL, pred_json, os.path.join(RESULTS_DIR, 'detr_metrics.csv'))
+        # Değerlendirme
+        model.eval()
+        results = []
+        with torch.no_grad():
+            for images, targets in val_loader:
+                pixel_values = torch.stack([img for img in images]).to(device)
+                outputs = model(pixel_values=pixel_values)
+                for i, logits in enumerate(outputs.logits):
+                    probas = logits.softmax(-1)[..., :-1]
+                    scores, labels = probas.max(-1)
+                    boxes = outputs.pred_boxes[i].cpu()
+                    image_id = targets[i]['image_id'].item()
+                    for box, score, label in zip(boxes, scores.cpu(), labels.cpu()):
+                        cx, cy, w, h = box.tolist()
+                        x = cx - w / 2
+                        y = cy - h / 2
+                        results.append({
+                            'image_id': image_id,
+                            'category_id': label.item(),
+                            'bbox': [x, y, w, h],
+                            'score': score.item()
+                        })
+        pred_json = os.path.join(RESULTS_DIR, 'detr_predictions.json')
+        with open(pred_json, 'w') as f:
+            json.dump(results, f)
+        run_coco_eval(DATA_COCO_VAL, pred_json, os.path.join(RESULTS_DIR, 'detr_metrics.csv'))
+        current_map = pd.read_csv(os.path.join(RESULTS_DIR, 'detr_metrics.csv'))['mAP@[IoU=0.5:0.95]'][0]
+        if current_map > best_map:
+            best_map = current_map
+            no_improve = 0
+            torch.save(model.state_dict(), os.path.join(RESULTS_DIR, 'detr_best.pth'))
+            print(f"Yeni en iyi DETR modeli kaydedildi (mAP={best_map:.4f})")
+        else:
+            no_improve += 1
+            if no_improve >= patience:
+                print("Erken durdurma tetiklendi.")
+                break
 
 # === GRAFİKLERİ OLUŞTUR VE KAYDET ===
 def plot_metric_comparison():
